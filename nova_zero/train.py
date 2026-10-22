@@ -55,6 +55,7 @@ class NovaTrainer:
         regret_weight: float = 0.5,
         video_record_prob: float = 0.25,
         output_dir: str = "outputs",
+        workers_per_gpu: int = 1,
     ):
         if isinstance(devices, (list, tuple)):
             self.devices = list(devices)
@@ -67,6 +68,7 @@ class NovaTrainer:
         self.regret_weight = regret_weight
         self.video_record_prob = video_record_prob
         self.output_dir = output_dir
+        self.workers_per_gpu = max(1, workers_per_gpu)
 
         # Initialize dedicated worker models per GPU
         self.worker_models = {}
@@ -74,7 +76,10 @@ class NovaTrainer:
             if d == self.primary_device:
                 self.worker_models[d] = self.model
             else:
-                replica = NovaZeroNet().to(d)
+                replica = NovaZeroNet(
+                    num_filters=getattr(self.model, "num_filters", 128),
+                    num_blocks=getattr(self.model, "num_blocks", 6)
+                ).to(d)
                 replica.load_state_dict(self.model.state_dict())
                 replica.eval()
                 self.worker_models[d] = replica
@@ -149,7 +154,10 @@ class NovaTrainer:
         opp_idx, opp_record = self.league.sample_opponent(temperature=80.0)
         opp_model = None
         if opp_record is not None:
-            opp_model = NovaZeroNet().to(target_device)
+            opp_model = NovaZeroNet(
+                num_filters=getattr(self.model, "num_filters", 128),
+                num_blocks=getattr(self.model, "num_blocks", 6)
+            ).to(target_device)
             opp_model.load_state_dict(opp_record.weights)
             opp_model.eval()
 
@@ -226,23 +234,28 @@ class NovaTrainer:
         self.model.train()
         self.optimizer.zero_grad()
 
-        # Multi-GPU batch parallelism if multiple GPUs are available
-        if len(self.devices) > 1 and states.is_cuda:
-            gpu_ids = [d.index for d in self.devices]
-            policy_logits, predicted_values, predicted_regrets = torch.nn.parallel.data_parallel(
-                self.model, states, device_ids=gpu_ids
-            )
-        else:
-            policy_logits, predicted_values, predicted_regrets = self.model(states)
+        use_cuda = states.is_cuda
+        amp_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
-        # 1. Value MSE Loss
-        loss_val = F.mse_loss(predicted_values, target_values)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_cuda):
+            # Multi-GPU batch parallelism if multiple GPUs are available
+            if len(self.devices) > 1 and use_cuda:
+                gpu_ids = [d.index for d in self.devices]
+                policy_logits, predicted_values, predicted_regrets = torch.nn.parallel.data_parallel(
+                    self.model, states, device_ids=gpu_ids
+                )
+            else:
+                policy_logits, predicted_values, predicted_regrets = self.model(states)
 
-        # 2. Fused Regret-Gated Policy Loss (Triton GPU Kernel or PyTorch fallback)
-        loss_rgpo = compute_rgpo_loss(policy_logits, target_pis, predicted_regrets, self.regret_weight)
+            # 1. Value MSE Loss (in float32 for precision)
+            loss_val = F.mse_loss(predicted_values.float(), target_values)
 
-        # Total Loss
-        total_loss = loss_val + loss_rgpo
+            # 2. Fused Regret-Gated Policy Loss (Triton GPU Kernel or PyTorch fallback)
+            loss_rgpo = compute_rgpo_loss(policy_logits.float(), target_pis, predicted_regrets.float(), self.regret_weight)
+
+            # Total Loss
+            total_loss = loss_val + loss_rgpo
+
         total_loss.backward()
         
         # Gradient Clipping
@@ -260,12 +273,14 @@ class NovaTrainer:
         """Runs parallel multi-GPU self-play training with blunder-aware credit assignment & 12h session guard."""
         target_episodes = self.start_episode + num_episodes - 1
         num_gpus = len(self.devices)
+        total_workers = num_gpus * self.workers_per_gpu
         start_time = time.time()
         max_seconds = max_hours * 3600.0
         
         print(f"=== Starting NovaZero Training Pipeline ===")
         print(f"Episodes: {self.start_episode} -> {target_episodes} (Total this run: {num_episodes}) | Max Session: {max_hours:.1f}h")
-        print(f"Active GPUs: {num_gpus} {self.devices} | Initial League Elo: {self.league.active_elo:.1f} | Peak Elo: {self.best_elo:.1f}")
+        print(f"Active GPUs: {num_gpus} {self.devices} | Workers per GPU: {self.workers_per_gpu} (Concurrent Games: {total_workers})")
+        print(f"Initial League Elo: {self.league.active_elo:.1f} | Peak Elo: {self.best_elo:.1f}")
 
         # Register initial weights if league is empty
         if len(self.league.checkpoints) == 0:
@@ -276,8 +291,8 @@ class NovaTrainer:
 
         ep = self.start_episode
         while ep <= target_episodes:
-            # Batch up to num_gpus episodes to execute simultaneously across all GPUs
-            batch_size_eps = min(num_gpus, target_episodes - ep + 1)
+            # Batch up to total_workers episodes to execute simultaneously across all GPUs
+            batch_size_eps = min(total_workers, target_episodes - ep + 1)
             batch_ep_indices = list(range(ep, ep + batch_size_eps))
 
             # Sync worker models with primary weights
@@ -288,11 +303,11 @@ class NovaTrainer:
                         if d != self.primary_device:
                             self.worker_models[d].load_state_dict(primary_weights)
 
-            # Parallel Self-Play across all GPUs
-            if num_gpus > 1 and batch_size_eps > 1:
+            # Parallel Self-Play across all GPUs and worker threads
+            if batch_size_eps > 1:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size_eps) as executor:
                     futures = [
-                        executor.submit(self.self_play_episode, ep_idx, sim_count, self.devices[i])
+                        executor.submit(self.self_play_episode, ep_idx, sim_count, self.devices[i % num_gpus])
                         for i, ep_idx in enumerate(batch_ep_indices)
                     ]
                     results = [f.result() for f in futures]
@@ -324,7 +339,7 @@ class NovaTrainer:
                 # Gradient Update
                 train_metrics = {"loss": 0.0}
                 if len(self.replay_buffer) >= batch_size:
-                    for _ in range(2):
+                    for _ in range(max(2, batch_size_eps // 2)):
                         train_metrics = self.train_step(batch_size=batch_size)
 
                 # Progress Logging
@@ -352,6 +367,8 @@ class NovaTrainer:
                         "league_elo": self.league.active_elo,
                         "best_elo": self.best_elo,
                         "league_checkpoints": league_cps,
+                        "num_filters": getattr(self.model, "num_filters", 128),
+                        "num_blocks": getattr(self.model, "num_blocks", 6),
                     }
                     torch.save(state, last_path)
                     self.league.register_checkpoint(step=curr_ep, model=self.model, initial_elo=self.league.active_elo)
@@ -377,6 +394,8 @@ class NovaTrainer:
                     "league_elo": self.league.active_elo,
                     "best_elo": self.best_elo,
                     "league_checkpoints": league_cps,
+                    "num_filters": getattr(self.model, "num_filters", 128),
+                    "num_blocks": getattr(self.model, "num_blocks", 6),
                 }
                 torch.save(state, last_path)
                 if self.league.active_elo > self.best_elo:

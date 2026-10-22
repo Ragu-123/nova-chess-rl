@@ -15,20 +15,26 @@ import subprocess
 
 def run():
     print("=" * 70)
-    print("   NOVAZERO: AUTONOMOUS 12-HOUR SESSION RUNNER")
+    print("   NOVAZERO: HIGH-PERFORMANCE 12-HOUR SESSION RUNNER (4x L4 SATURATOR)")
     print("=" * 70)
+
+    # Any extra CLI args passed to run_12hr_session.py are passed through to main.py
+    extra_args = sys.argv[1:]
 
     cmd = [
         sys.executable, "main.py",
         "--mode", "train",
-        "--resume",               # Auto-resumes from last.pt if exists
-        "--episodes", "5000",     # Target large batch for continuous 12h run
-        "--simulations", "40",    # Baseline simulations (PCR will dynamically boost to 120 on tactics)
-        "--batch-size", "64",
-        "--max-hours", "11.5",    # Exit safely after 11.5 hours before Kaggle shutdown
+        "--resume",                  # Auto-resumes from last.pt without losing steps/Elo
+        "--episodes", "5000",        # Continuous 12h run target
+        "--simulations", "150",      # Deep search (Dynamic PCR boosts to 450 on tactics)
+        "--workers-per-gpu", "2",    # 2 concurrent games per GPU (8 total parallel games on 4x L4)
+        "--batch-size", "256",       # Saturates Tensor Cores across 4 GPUs (64 per GPU)
+        "--num-blocks", "10",        # Deep ResNet backbone
+        "--num-filters", "192",      # High-capacity feature maps
+        "--max-hours", "11.5",       # Exit safely before Kaggle 12h limit
         "--output-dir", "outputs",
-        "--device", "auto",       # Parallel multi-GPU auto-detection
-    ]
+        "--device", "auto",          # Parallel auto-scaling across all 4 GPUs
+    ] + extra_args
 
     print(f"Executing: {' '.join(cmd)}\n")
     subprocess.run(cmd)

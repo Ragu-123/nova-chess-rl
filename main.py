@@ -25,6 +25,9 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=30, help="Number of self-play episodes to run this session")
     parser.add_argument("--simulations", type=int, default=35, help="Number of MCTS simulations per move")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training updates")
+    parser.add_argument("--num-blocks", type=int, default=6, help="Number of residual blocks in backbone (6, 10, or 12)")
+    parser.add_argument("--num-filters", type=int, default=128, help="Number of convolutional filters (128, 192, or 256)")
+    parser.add_argument("--workers-per-gpu", type=int, default=1, help="Concurrent self-play workers per GPU (e.g. 2 or 3)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--regret-weight", type=float, default=0.5, help="Weight for regret-gated policy penalty")
     parser.add_argument("--record-prob", type=float, default=0.25, help="Probability of recording episode as MP4")
@@ -93,7 +96,22 @@ def main():
 
     # 3. Training Mode (Multi-GPU Parallel)
     if args.mode == "train":
-        model = NovaZeroNet().to(primary_device)
+        num_blocks = args.num_blocks
+        num_filters = args.num_filters
+
+        # Check if resume checkpoint has saved architecture parameters
+        resume_target = args.checkpoint if (args.checkpoint and os.path.exists(args.checkpoint)) else last_ckpt
+        if (args.resume or args.checkpoint) and os.path.exists(resume_target):
+            try:
+                cp_meta = torch.load(resume_target, map_location="cpu")
+                if "num_blocks" in cp_meta:
+                    num_blocks = cp_meta["num_blocks"]
+                if "num_filters" in cp_meta:
+                    num_filters = cp_meta["num_filters"]
+            except Exception:
+                pass
+
+        model = NovaZeroNet(num_filters=num_filters, num_blocks=num_blocks).to(primary_device)
         trainer = NovaTrainer(
             model=model,
             devices=devices,
@@ -101,6 +119,7 @@ def main():
             regret_weight=args.regret_weight,
             video_record_prob=args.record_prob,
             output_dir=args.output_dir,
+            workers_per_gpu=args.workers_per_gpu,
         )
 
         # Check for resume
@@ -119,13 +138,20 @@ def main():
 
     # 4. Evaluation Mode
     if args.mode == "eval":
-        model = NovaZeroNet().to(primary_device)
         ckpt_to_load = args.checkpoint or (best_ckpt if os.path.exists(best_ckpt) else (last_ckpt if os.path.exists(last_ckpt) else None))
+        num_blocks = args.num_blocks
+        num_filters = args.num_filters
         if ckpt_to_load and os.path.exists(ckpt_to_load):
             print(f"Loading checkpoint for evaluation: {ckpt_to_load}")
             checkpoint_data = torch.load(ckpt_to_load, map_location=primary_device)
+            if "num_blocks" in checkpoint_data:
+                num_blocks = checkpoint_data["num_blocks"]
+            if "num_filters" in checkpoint_data:
+                num_filters = checkpoint_data["num_filters"]
+            model = NovaZeroNet(num_filters=num_filters, num_blocks=num_blocks).to(primary_device)
             model.load_state_dict(checkpoint_data.get("model_state_dict", checkpoint_data))
         else:
+            model = NovaZeroNet(num_filters=num_filters, num_blocks=num_blocks).to(primary_device)
             print("Warning: Running tournament with untrained weights (no checkpoint found).")
 
         run_tournament(

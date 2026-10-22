@@ -48,6 +48,8 @@ class NovaZeroNet(nn.Module):
     """High-Throughput Policy-Value-Regret Network for Chess."""
     def __init__(self, in_channels: int = NUM_PLANES, num_filters: int = 128, num_blocks: int = 6):
         super().__init__()
+        self.num_filters = num_filters
+        self.num_blocks = num_blocks
         
         # Initial Convolutional Stem
         self.conv_stem = nn.Conv2d(in_channels, num_filters, kernel_size=3, padding=1, bias=False)
