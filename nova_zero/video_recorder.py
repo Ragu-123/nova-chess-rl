@@ -26,10 +26,11 @@ UNICODE_PIECES = {
 
 class ChessVideoRecorder:
     """Records full game trajectories and encodes them into MP4 videos."""
-    def __init__(self, output_dir: str = "outputs/videos", fps: int = 2, square_size: int = 70):
+    def __init__(self, output_dir: str = "outputs/videos", fps: int = 2, square_size: int = 70, max_videos: int = 10):
         self.output_dir = output_dir
         self.fps = fps
         self.sq_size = square_size
+        self.max_videos = max_videos
         self.board_size = square_size * 8
         self.header_height = 80
         self.eval_bar_height = 16
@@ -149,4 +150,19 @@ class ChessVideoRecorder:
         out.release()
         self.frames = []
         self.recording_active = False
+
+        # Zero-Bloat Auto Pruning: Keep only latest `max_videos` to preserve disk space
+        try:
+            existing_videos = [
+                os.path.join(self.output_dir, f)
+                for f in os.listdir(self.output_dir)
+                if f.endswith(".mp4")
+            ]
+            if len(existing_videos) > self.max_videos:
+                existing_videos.sort(key=os.path.getmtime)
+                for old_vid in existing_videos[:-self.max_videos]:
+                    os.remove(old_vid)
+        except Exception:
+            pass
+
         return file_path

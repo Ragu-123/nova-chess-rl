@@ -14,7 +14,7 @@ from .constants import move_to_action, action_to_move, ACTION_SPACE_SIZE
 from .encoder import encode_board, get_legal_action_mask
 from .model import NovaZeroNet
 from .mcts import BQSMCTS
-from .elo_league import PredecessorLeague
+from .elo_league import PredecessorLeague, CheckpointRecord
 from .video_recorder import ChessVideoRecorder
 from .triton_rgpo import compute_rgpo_loss
 
@@ -61,6 +61,8 @@ class NovaTrainer:
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.replay_buffer = ReplayBuffer(capacity=20000)
         self.league = PredecessorLeague(max_capacity=10)
+        self.start_episode = 1
+        self.best_elo = 1200.0
         self.recorder = ChessVideoRecorder(
             output_dir=os.path.join(output_dir, "videos"),
             fps=2,
@@ -68,6 +70,36 @@ class NovaTrainer:
         )
 
         os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Resumes model, optimizer, episode count, and league state without memory bloat."""
+        if not os.path.exists(checkpoint_path):
+            print(f"[Resume] Checkpoint not found at '{checkpoint_path}'. Starting from Episode 1.")
+            return
+
+        print(f"[Resume] Loading state from '{checkpoint_path}'...")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            
+        self.start_episode = checkpoint.get("episode", 0) + 1
+        self.league.active_elo = checkpoint.get("league_elo", 1200.0)
+        self.best_elo = checkpoint.get("best_elo", self.league.active_elo)
+
+        # Restore league pool
+        if "league_checkpoints" in checkpoint:
+            self.league.checkpoints = []
+            for cp in checkpoint["league_checkpoints"]:
+                self.league.checkpoints.append(
+                    CheckpointRecord(step=cp["step"], weights=cp["weights"], elo=cp["elo"])
+                )
+
+        print(
+            f"[Resume] Successfully resumed! Next Episode: {self.start_episode} | "
+            f"Active Elo: {self.league.active_elo:.1f} | Best Elo: {self.best_elo:.1f} | "
+            f"League Pool: {len(self.league.checkpoints)} opponents"
+        )
 
     def self_play_episode(self, episode_idx: int, simulations: int = 40) -> tuple[float, int, str]:
         """Plays one game of self-play or match against a historical predecessor."""
@@ -190,14 +222,20 @@ class NovaTrainer:
         }
 
     def train(self, num_episodes: int = 50, batch_size: int = 64, sim_count: int = 30, checkpoint_freq: int = 10):
-        """Runs the complete self-play and training loop."""
+        """Runs the complete self-play and training loop with resume support & zero disk bloat."""
+        target_episodes = self.start_episode + num_episodes - 1
         print(f"=== Starting NovaZero Training Pipeline ===")
-        print(f"Episodes: {num_episodes} | Device: {self.device} | Initial League Elo: {self.league.active_elo:.1f}")
+        print(f"Episodes: {self.start_episode} -> {target_episodes} (Total this run: {num_episodes})")
+        print(f"Device: {self.device} | Initial League Elo: {self.league.active_elo:.1f} | Peak Elo: {self.best_elo:.1f}")
 
-        # Register initial weights
-        self.league.register_checkpoint(step=0, model=self.model, initial_elo=1200.0)
+        # Register initial weights if league is empty
+        if len(self.league.checkpoints) == 0:
+            self.league.register_checkpoint(step=self.start_episode - 1, model=self.model, initial_elo=self.league.active_elo)
 
-        for ep in range(1, num_episodes + 1):
+        ckpt_dir = os.path.join(self.output_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        for ep in range(self.start_episode, target_episodes + 1):
             # 1. Self-Play Episode
             reward, steps, video_path = self.self_play_episode(ep, simulations=sim_count)
             
@@ -210,19 +248,37 @@ class NovaTrainer:
             # 3. Progress Logging
             video_flag = f" [MP4 Saved: {os.path.basename(video_path)}]" if video_path else ""
             print(
-                f"Episode {ep:03d}/{num_episodes:03d} | Steps: {steps:02d} | "
+                f"Episode {ep:04d}/{target_episodes:04d} | Steps: {steps:02d} | "
                 f"Reward: {reward:+.1f} | Buffer: {len(self.replay_buffer):04d} | "
                 f"Loss: {train_metrics['loss']:.4f} | Elo: {self.league.active_elo:.1f}{video_flag}"
             )
 
-            # 4. Checkpointing
-            if ep % checkpoint_freq == 0 or ep == num_episodes:
-                ckpt_path = os.path.join(self.output_dir, "checkpoints", f"novazero_ep_{ep:04d}.pt")
-                torch.save({
+            # 4. Checkpointing (Strict zero-bloat: last.pt & best.pt only)
+            if ep % checkpoint_freq == 0 or ep == target_episodes:
+                last_path = os.path.join(ckpt_dir, "last.pt")
+                best_path = os.path.join(ckpt_dir, "best.pt")
+
+                league_cps = [
+                    {"step": cp.step, "weights": cp.weights, "elo": cp.elo}
+                    for cp in self.league.checkpoints
+                ]
+                state = {
                     "episode": ep,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "league_elo": self.league.active_elo,
-                }, ckpt_path)
+                    "best_elo": self.best_elo,
+                    "league_checkpoints": league_cps,
+                }
+                
+                # Overwrite last.pt
+                torch.save(state, last_path)
                 self.league.register_checkpoint(step=ep, model=self.model, initial_elo=self.league.active_elo)
-                print(f"--> Checkpoint saved: {ckpt_path} (League updated)")
+                print(f"--> [Checkpoint] Saved '{last_path}' (Episode {ep})")
+
+                # If new best Elo reached, overwrite best.pt
+                if self.league.active_elo > self.best_elo:
+                    self.best_elo = self.league.active_elo
+                    state["best_elo"] = self.best_elo
+                    torch.save(state, best_path)
+                    print(f"--> [NEW BEST] Saved '{best_path}' (Peak Elo: {self.best_elo:.1f})")
