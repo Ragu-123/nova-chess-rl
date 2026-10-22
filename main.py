@@ -1,7 +1,7 @@
 """Main CLI entry point for NovaZero Chess Reinforcement Learning Engine.
 
 Supported Modes:
-- train: Self-play training with resume support & zero-bloat checkpointing (last.pt & best.pt)
+- train: Multi-GPU parallel self-play training with resume & zero-bloat checkpointing
 - eval: Benchmark tournament against greedy heuristic baseline
 - uci: Universal Chess Interface engine protocol (for lichess-bot & cutechess-cli)
 - lichess: Standalone live bot runner connected to Lichess Bot API
@@ -31,23 +31,42 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=None, help="Specific path to checkpoint .pt file")
     parser.add_argument("--resume", action="store_true", help="Resume training from last.pt without losing progress")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory for checkpoints/videos")
-    parser.add_argument("--device", type=str, default="auto", help="Execution device: cuda, cpu, or auto")
+    parser.add_argument("--device", type=str, default="auto", help="Execution device: auto (detects all GPUs), cuda, or cpu")
     parser.add_argument("--lichess-token", type=str, default=None, help="API token for lichess.org BOT account")
     return parser.parse_args()
 
 def main():
     args = parse_args()
 
-    # Determine device
+    # Determine devices (Auto-detect all available GPUs, e.g. 4x L4 or 2x T4)
     if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if num_gpus > 1:
+            devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
+            primary_device = devices[0]
+            gpu_desc = f"{num_gpus}x GPUs Parallel ({torch.cuda.get_device_name(0)})"
+        elif num_gpus == 1:
+            devices = [torch.device("cuda:0")]
+            primary_device = devices[0]
+            gpu_desc = f"1x GPU ({torch.cuda.get_device_name(0)})"
+        else:
+            devices = [torch.device("cpu")]
+            primary_device = devices[0]
+            gpu_desc = "CPU"
     else:
-        device = torch.device(args.device)
+        primary_device = torch.device(args.device)
+        devices = [primary_device]
+        gpu_desc = str(args.device)
 
-    print("=" * 65)
+    print("=" * 68)
     print("   NOVAZERO: Regret-Gated Elo-League Self-Play Chess Engine")
-    print(f"   Target Device: {device} | Execution Mode: {args.mode.upper()}")
-    print("=" * 65)
+    print(f"   Target Device: {gpu_desc} | Execution Mode: {args.mode.upper()}")
+    if len(devices) > 1:
+        print(f"   🚀 Multi-GPU Auto-Scaling ACTIVE across {len(devices)} GPUs in parallel:")
+        for i, d in enumerate(devices):
+            vram = torch.cuda.get_device_properties(d).total_memory / (1024**3)
+            print(f"      - Worker GPU {i}: {torch.cuda.get_device_name(d)} ({vram:.1f} GB VRAM)")
+    print("=" * 68)
 
     ckpt_dir = os.path.join(args.output_dir, "checkpoints")
     last_ckpt = os.path.join(ckpt_dir, "last.pt")
@@ -56,7 +75,7 @@ def main():
     # 1. UCI Engine Mode
     if args.mode == "uci":
         ckpt_to_load = args.checkpoint or (best_ckpt if os.path.exists(best_ckpt) else (last_ckpt if os.path.exists(last_ckpt) else None))
-        engine = UCIEngine(checkpoint_path=ckpt_to_load, device_str=str(device), simulations=args.simulations)
+        engine = UCIEngine(checkpoint_path=ckpt_to_load, device_str=str(primary_device), simulations=args.simulations)
         engine.run()
         return
 
@@ -67,16 +86,16 @@ def main():
             print("Error: Lichess Bot API token required! Pass --lichess-token <TOKEN> or set LICHESS_BOT_TOKEN env var.")
             sys.exit(1)
         ckpt_to_load = args.checkpoint or (best_ckpt if os.path.exists(best_ckpt) else (last_ckpt if os.path.exists(last_ckpt) else None))
-        bot = LichessBot(token=token, checkpoint_path=ckpt_to_load, simulations=args.simulations, device_str=str(device))
+        bot = LichessBot(token=token, checkpoint_path=ckpt_to_load, simulations=args.simulations, device_str=str(primary_device))
         bot.start_event_stream()
         return
 
-    # 3. Training Mode
+    # 3. Training Mode (Multi-GPU Parallel)
     if args.mode == "train":
-        model = NovaZeroNet().to(device)
+        model = NovaZeroNet().to(primary_device)
         trainer = NovaTrainer(
             model=model,
-            device=device,
+            devices=devices,
             lr=args.lr,
             regret_weight=args.regret_weight,
             video_record_prob=args.record_prob,
@@ -98,18 +117,18 @@ def main():
 
     # 4. Evaluation Mode
     if args.mode == "eval":
-        model = NovaZeroNet().to(device)
+        model = NovaZeroNet().to(primary_device)
         ckpt_to_load = args.checkpoint or (best_ckpt if os.path.exists(best_ckpt) else (last_ckpt if os.path.exists(last_ckpt) else None))
         if ckpt_to_load and os.path.exists(ckpt_to_load):
             print(f"Loading checkpoint for evaluation: {ckpt_to_load}")
-            checkpoint_data = torch.load(ckpt_to_load, map_location=device)
+            checkpoint_data = torch.load(ckpt_to_load, map_location=primary_device)
             model.load_state_dict(checkpoint_data.get("model_state_dict", checkpoint_data))
         else:
             print("Warning: Running tournament with untrained weights (no checkpoint found).")
 
         run_tournament(
             model=model,
-            device=device,
+            device=primary_device,
             num_games=10,
             simulations=args.simulations,
             record_video=True,
