@@ -62,6 +62,9 @@ class UCIEngine:
             sys.stdout.flush()
 
         elif cmd == "isready":
+            dummy = torch.zeros((1, 19, 8, 8), device=self.device)
+            with torch.inference_mode():
+                _ = self.model.predict_eval(dummy) if hasattr(self.model, "predict_eval") else self.model(dummy)
             print("readyok")
             sys.stdout.flush()
 
@@ -76,6 +79,7 @@ class UCIEngine:
 
         elif cmd == "ucinewgame":
             self.board = chess.Board()
+            self.mcts.clear_cache()
 
         elif cmd == "position":
             # Syntax: position [fen <FEN> | startpos] moves <move1> ...

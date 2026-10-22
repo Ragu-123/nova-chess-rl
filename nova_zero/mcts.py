@@ -65,6 +65,7 @@ class BQSMCTS:
         c_puct: float = 1.4,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        max_tt_size: int = 50000,
     ):
         self.model = model
         self.device = device
@@ -72,6 +73,12 @@ class BQSMCTS:
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
+        self.max_tt_size = max_tt_size
+        self.transposition_table = {}  # Zobrist hash -> (action_priors, value)
+
+    def clear_cache(self):
+        """Resets the transposition cache."""
+        self.transposition_table.clear()
 
     def search(self, board: chess.Board, add_noise: bool = True) -> tuple[np.ndarray, float]:
         """Runs MCTS simulations from the current board position.
@@ -140,11 +147,23 @@ class BQSMCTS:
         return pi, root.q_value
 
     def _evaluate_and_expand(self, node: MCTSNode, board: chess.Board) -> tuple[dict, float]:
-        """Runs neural network inference and expands node."""
-        tensor = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
+        """Runs fast neural network inference with transposition table caching."""
+        # 1. Transposition Table Lookup (0.01 ms O(1) cache hit)
+        zkey = board._transposition_key()
+        if zkey in self.transposition_table:
+            action_priors, value = self.transposition_table[zkey]
+            node.expand(action_priors)
+            return action_priors, value
+
+        # 2. Optimized Neural Forward Pass
+        tensor = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device, non_blocking=True)
         self.model.eval()
-        with torch.no_grad():
-            policy_logits, value, _ = self.model(tensor)
+
+        with torch.inference_mode():
+            if hasattr(self.model, "predict_eval"):
+                policy_logits, value = self.model.predict_eval(tensor)
+            else:
+                policy_logits, value, _ = self.model(tensor)
             
         policy_logits = policy_logits.squeeze(0).cpu().numpy()
         value = value.item()
@@ -161,6 +180,10 @@ class BQSMCTS:
         priors = exp_logits / sum_exp if sum_exp > 0 else np.ones_like(exp_logits) / len(exp_logits)
         action_priors = {action: float(priors[action]) for action in np.where(legal_mask)[0]}
         
+        # Store in bounded transposition cache
+        if len(self.transposition_table) < self.max_tt_size:
+            self.transposition_table[zkey] = (action_priors, value)
+
         node.expand(action_priors)
         return action_priors, value
 

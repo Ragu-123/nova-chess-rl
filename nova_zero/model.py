@@ -104,3 +104,21 @@ class NovaZeroNet(nn.Module):
         regret = F.relu(self.regret_fc(r))
         
         return policy_logits, value, regret
+
+    @torch.inference_mode()
+    def predict_eval(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Ultra-fast inference path: evaluates policy and value only, bypassing regret head."""
+        out = F.relu(self.bn_stem(self.conv_stem(x)), inplace=True)
+        for block in self.blocks:
+            out = block(out)
+
+        # Policy
+        p = F.relu(self.policy_bn(self.policy_conv(out)), inplace=True)
+        policy_logits = self.policy_fc(p.flatten(start_dim=1))
+
+        # Value
+        v = F.relu(self.value_bn(self.value_conv(out)), inplace=True)
+        v = F.relu(self.value_fc1(v.flatten(start_dim=1)), inplace=True)
+        value = torch.tanh(self.value_fc2(v))
+
+        return policy_logits, value
