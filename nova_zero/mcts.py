@@ -4,8 +4,19 @@ import math
 import numpy as np
 import torch
 import chess
+import random
 from .constants import move_to_action, action_to_move, ACTION_SPACE_SIZE
 from .encoder import encode_board, get_legal_action_mask
+
+# Piece material values for tactical quiescence
+PIECE_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK: 500,
+    chess.QUEEN: 900,
+    chess.KING: 20000,
+}
 
 class MCTSNode:
     """Node in the Monte Carlo Search Tree."""
@@ -66,6 +77,8 @@ class BQSMCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         max_tt_size: int = 50000,
+        deep_rollout_prob: float = 0.20,
+        deep_rollout_mult: float = 3.0,
     ):
         self.model = model
         self.device = device
@@ -74,14 +87,16 @@ class BQSMCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
         self.max_tt_size = max_tt_size
+        self.deep_rollout_prob = deep_rollout_prob
+        self.deep_rollout_mult = deep_rollout_mult
         self.transposition_table = {}  # Zobrist hash -> (action_priors, value)
 
     def clear_cache(self):
         """Resets the transposition cache."""
         self.transposition_table.clear()
 
-    def search(self, board: chess.Board, add_noise: bool = True) -> tuple[np.ndarray, float]:
-        """Runs MCTS simulations from the current board position.
+    def search(self, board: chess.Board, add_noise: bool = True, pcr: bool = True) -> tuple[np.ndarray, float]:
+        """Runs MCTS simulations with Playout Cap Randomization (PCR) for deep horizon vision.
         
         Returns:
             pi: Policy probability distribution over 4096 actions.
@@ -89,6 +104,11 @@ class BQSMCTS:
         """
         root = MCTSNode()
         
+        # Playout Cap Randomization: 20% deep rollouts (3x sims) to break horizon plateaus
+        sims = self.num_simulations
+        if pcr and (random.random() < self.deep_rollout_prob):
+            sims = int(self.num_simulations * self.deep_rollout_mult)
+
         # Initial expansion of root
         root_priors, root_val = self._evaluate_and_expand(root, board)
         
@@ -97,7 +117,7 @@ class BQSMCTS:
             for i, child in enumerate(root.children.values()):
                 child.prior = (1 - self.dirichlet_epsilon) * child.prior + self.dirichlet_epsilon * noise[i]
 
-        for _ in range(self.num_simulations):
+        for _ in range(sims):
             node = root
             scratch_board = board.copy(stack=False)
             search_path = [node]
@@ -187,16 +207,66 @@ class BQSMCTS:
         node.expand(action_priors)
         return action_priors, value
 
-    def _quiescence_check(self, board: chess.Board, static_val: float) -> float:
-        """Fast bitboard tactical quiescence filter.
+    def _quiescence_check(self, board: chess.Board, static_val: float, max_depth: int = 3) -> float:
+        """Deep tactical quiescence search on captures/checks (MVV-LVA).
         
-        If immediate hanging captures exist, discounts overly optimistic static evals.
+        Solves the search depth horizon problem by recursively verifying forcing tactical exchanges.
         """
-        # Fast capture check: does opponent have high-value captures?
-        for move in board.legal_moves:
-            if board.is_capture(move):
-                piece_captured = board.piece_at(move.to_square)
-                if piece_captured and piece_captured.piece_type in [chess.QUEEN, chess.ROOK]:
-                    # Tactical volatility detected: damp static optimism towards draw/risk
-                    return static_val * 0.8
-        return static_val
+        stand_pat = self._eval_material_balance(board)
+        
+        # Fast exit if quiet position
+        captures = [m for m in board.legal_moves if board.is_capture(m)]
+        if not captures or max_depth <= 0:
+            return static_val
+
+        # Sort captures by MVV-LVA (Most Valuable Victim, Least Valuable Attacker)
+        def mvv_lva_score(move):
+            victim = board.piece_at(move.to_square)
+            attacker = board.piece_at(move.from_square)
+            v_val = PIECE_VALUES.get(victim.piece_type, 0) if victim else 0
+            a_val = PIECE_VALUES.get(attacker.piece_type, 0) if attacker else 0
+            return v_val * 10 - a_val
+
+        captures.sort(key=mvv_lva_score, reverse=True)
+
+        best_score = stand_pat
+        for move in captures[:4]:  # Top 4 most forcing captures
+            board.push(move)
+            score = -self._quiescence_eval(board, -best_score - 500, -best_score, max_depth - 1)
+            board.pop()
+            if score > best_score:
+                best_score = score
+
+        # Convert tactical delta to [-1, 1] tanh blend
+        tactical_val = math.tanh((best_score - stand_pat) / 400.0)
+        return float(np.clip(0.60 * static_val + 0.40 * tactical_val, -1.0, 1.0))
+
+    def _quiescence_eval(self, board: chess.Board, alpha: int, beta: int, depth: int) -> int:
+        stand_pat = self._eval_material_balance(board)
+        if depth <= 0 or board.is_game_over():
+            return stand_pat
+        if stand_pat >= beta:
+            return beta
+        if alpha < stand_pat:
+            alpha = stand_pat
+
+        captures = [m for m in board.legal_moves if board.is_capture(m)]
+        for move in captures[:3]:
+            board.push(move)
+            score = -self._quiescence_eval(board, -beta, -alpha, depth - 1)
+            board.pop()
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+        return alpha
+
+    def _eval_material_balance(self, board: chess.Board) -> int:
+        """Centipawn score relative to the current player to move."""
+        score = 0
+        for sq in chess.SQUARES:
+            p = board.piece_at(sq)
+            if p:
+                v = PIECE_VALUES.get(p.piece_type, 0)
+                score += v if p.color == board.turn else -v
+        return score

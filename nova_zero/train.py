@@ -19,6 +19,8 @@ from .mcts import BQSMCTS
 from .elo_league import PredecessorLeague, CheckpointRecord
 from .video_recorder import ChessVideoRecorder
 from .triton_rgpo import compute_rgpo_loss
+from .openings import get_opening_move
+import time
 
 class ReplayBuffer:
     """Experience replay buffer for storing self-play game trajectories."""
@@ -172,19 +174,24 @@ class NovaTrainer:
             temp = 1.0 if step < 12 else 0.2
             pi, eval_score = mcts.search(board, add_noise=True)
 
-            # Store experience for the active agent only
+            # Store experience for the active agent only (including local root Q for credit assignment)
             if opp_model is None or current_turn == chess.WHITE:
-                trajectory.append((state_tensor, pi, current_turn))
+                trajectory.append((state_tensor, pi, current_turn, eval_score))
 
-            # Select Action
-            if temp == 1.0:
-                action = np.random.choice(ACTION_SPACE_SIZE, p=pi)
+            # Grandmaster Opening Book Seeding in early moves
+            gm_move = get_opening_move(board, step, seed_prob=0.40)
+            if gm_move is not None:
+                move = gm_move
             else:
-                action = int(np.argmax(pi))
+                # Select Action from MCTS policy
+                if temp == 1.0:
+                    action = np.random.choice(ACTION_SPACE_SIZE, p=pi)
+                else:
+                    action = int(np.argmax(pi))
 
-            move = action_to_move(action, board)
-            if move not in board.legal_moves:
-                move = random.choice(list(board.legal_moves))
+                move = action_to_move(action, board)
+                if move not in board.legal_moves:
+                    move = random.choice(list(board.legal_moves))
 
             if recording:
                 self.recorder.capture_frame(board, last_move=last_move, step=step, eval_score=eval_score)
@@ -249,13 +256,15 @@ class NovaTrainer:
             "regret_penalty": 0.0,
         }
 
-    def train(self, num_episodes: int = 50, batch_size: int = 64, sim_count: int = 30, checkpoint_freq: int = 10):
-        """Runs parallel multi-GPU self-play training with zero disk bloat."""
+    def train(self, num_episodes: int = 50, batch_size: int = 64, sim_count: int = 30, checkpoint_freq: int = 10, max_hours: float = 11.5):
+        """Runs parallel multi-GPU self-play training with blunder-aware credit assignment & 12h session guard."""
         target_episodes = self.start_episode + num_episodes - 1
         num_gpus = len(self.devices)
+        start_time = time.time()
+        max_seconds = max_hours * 3600.0
         
         print(f"=== Starting NovaZero Training Pipeline ===")
-        print(f"Episodes: {self.start_episode} -> {target_episodes} (Total this run: {num_episodes})")
+        print(f"Episodes: {self.start_episode} -> {target_episodes} (Total this run: {num_episodes}) | Max Session: {max_hours:.1f}h")
         print(f"Active GPUs: {num_gpus} {self.devices} | Initial League Elo: {self.league.active_elo:.1f} | Peak Elo: {self.best_elo:.1f}")
 
         # Register initial weights if league is empty
@@ -291,12 +300,21 @@ class NovaTrainer:
                 # Single device execution
                 results = [self.self_play_episode(batch_ep_indices[0], sim_count, self.primary_device)]
 
-            # Ingest all game results into ReplayBuffer & update Elo
+            # Ingest all game results into ReplayBuffer with Blunder-Aware TD Credit Assignment
+            gamma = 0.96
+            last_finished_ep = ep
             for i, (trajectory, white_reward, steps, video_path, opp_idx, opp_record) in enumerate(results):
                 curr_ep = batch_ep_indices[i]
-                for state, pi, player in trajectory:
-                    target_value = white_reward if player == chess.WHITE else -white_reward
-                    self.replay_buffer.push(state, pi, target_value)
+                last_finished_ep = curr_ep
+                T = len(trajectory)
+                for t, (state, pi, player, root_q) in enumerate(trajectory):
+                    z_term = white_reward if player == chess.WHITE else -white_reward
+                    # Blunder-Aware Credit Assignment:
+                    # Early good moves preserve their local positional value (root_q)
+                    # Late blunders are isolated and penalized with full z_term weight
+                    weight = gamma ** (T - 1 - t)
+                    blended_value = weight * z_term + (1.0 - weight) * root_q
+                    self.replay_buffer.push(state, pi, blended_value)
 
                 # Update Elo
                 match_score = (white_reward + 1.0) / 2.0
@@ -344,5 +362,28 @@ class NovaTrainer:
                         state["best_elo"] = self.best_elo
                         torch.save(state, best_path)
                         print(f"--> [NEW BEST] Saved '{best_path}' (Peak Elo: {self.best_elo:.1f})")
+
+            # Check 12-Hour Session Limit Guard
+            if time.time() - start_time >= max_seconds:
+                print(f"\n⏰ [Session Guard] Approaching session timeout ({max_hours:.1f} hrs)!")
+                print("   Safely saving last.pt & best.pt before Kaggle shutdown...")
+                last_path = os.path.join(ckpt_dir, "last.pt")
+                best_path = os.path.join(ckpt_dir, "best.pt")
+                league_cps = [{"step": cp.step, "weights": cp.weights, "elo": cp.elo} for cp in self.league.checkpoints]
+                state = {
+                    "episode": last_finished_ep,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "league_elo": self.league.active_elo,
+                    "best_elo": self.best_elo,
+                    "league_checkpoints": league_cps,
+                }
+                torch.save(state, last_path)
+                if self.league.active_elo > self.best_elo:
+                    self.best_elo = self.league.active_elo
+                    state["best_elo"] = self.best_elo
+                    torch.save(state, best_path)
+                print(f"--> [Graceful Exit] Checkpoint secured at Episode {last_finished_ep}. Resume with --resume anytime!")
+                break
 
             ep += batch_size_eps

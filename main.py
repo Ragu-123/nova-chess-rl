@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Resume training from last.pt without losing progress")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory for checkpoints/videos")
     parser.add_argument("--device", type=str, default="auto", help="Execution device: auto (detects all GPUs), cuda, or cpu")
+    parser.add_argument("--max-hours", type=float, default=11.5, help="Maximum continuous runtime in hours before graceful exit (for Kaggle 12h sessions)")
     parser.add_argument("--lichess-token", type=str, default=None, help="API token for lichess.org BOT account")
     return parser.parse_args()
 
@@ -112,6 +113,7 @@ def main():
             batch_size=args.batch_size,
             sim_count=args.simulations,
             checkpoint_freq=max(1, min(10, args.episodes // 2)),
+            max_hours=args.max_hours,
         )
         return
 
