@@ -16,6 +16,7 @@ from .model import NovaZeroNet
 from .mcts import BQSMCTS
 from .elo_league import PredecessorLeague
 from .video_recorder import ChessVideoRecorder
+from .triton_rgpo import compute_rgpo_loss
 
 class ReplayBuffer:
     """Experience replay buffer for storing self-play game trajectories."""
@@ -170,17 +171,11 @@ class NovaTrainer:
         # 1. Value MSE Loss
         loss_val = F.mse_loss(predicted_values, target_values)
 
-        # 2. Policy Cross-Entropy Loss
-        log_probs = F.log_softmax(policy_logits, dim=-1)
-        loss_policy_ce = -(target_pis * log_probs).sum(dim=-1).mean()
-
-        # 3. Novel Regret-Gate Penalty:
-        # Penalizes assigning high probability to actions with high predicted regret
-        probs = F.softmax(policy_logits, dim=-1)
-        loss_regret_gate = (probs * predicted_regrets).sum(dim=-1).mean()
+        # 2. Fused Regret-Gated Policy Loss (Triton GPU Kernel or PyTorch fallback)
+        loss_rgpo = compute_rgpo_loss(policy_logits, target_pis, predicted_regrets, self.regret_weight)
 
         # Total Loss
-        total_loss = loss_val + loss_policy_ce + self.regret_weight * loss_regret_gate
+        total_loss = loss_val + loss_rgpo
         total_loss.backward()
         
         # Gradient Clipping
@@ -190,8 +185,8 @@ class NovaTrainer:
         return {
             "loss": total_loss.item(),
             "value_loss": loss_val.item(),
-            "policy_loss": loss_policy_ce.item(),
-            "regret_penalty": loss_regret_gate.item(),
+            "policy_loss": loss_rgpo.item(),
+            "regret_penalty": 0.0,
         }
 
     def train(self, num_episodes: int = 50, batch_size: int = 64, sim_count: int = 30, checkpoint_freq: int = 10):
